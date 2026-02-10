@@ -1,7 +1,24 @@
 <?php
 require_once __DIR__ . '/../config.php';
 $action = $_GET['action'] ?? '';
-$pdo = db();
+
+try {
+    $pdo = db();
+} catch (Throwable $e) {
+    jsonResponse([
+        'error' => 'Lỗi CSDL: ' . $e->getMessage(),
+        'db_file' => DB_FILE,
+    ], 500);
+}
+
+if ($action === 'health') {
+    jsonResponse([
+        'ok' => true,
+        'db_file' => DB_FILE,
+        'db_exists' => file_exists(DB_FILE),
+        'sqlite_driver' => in_array('sqlite', PDO::getAvailableDrivers(), true),
+    ]);
+}
 
 if ($action === 'login' && $_SERVER['REQUEST_METHOD'] === 'POST') {
     $input = json_decode(file_get_contents('php://input'), true);

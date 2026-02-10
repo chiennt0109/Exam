@@ -1,7 +1,28 @@
 <?php
 session_start();
 
-define('DB_FILE', __DIR__ . '/exam.db');
+function resolveDbFile(): string {
+    $candidates = [
+        __DIR__ . '/data/exam.db',
+        __DIR__ . '/exam.db',
+        sys_get_temp_dir() . '/exam.db',
+    ];
+
+    foreach ($candidates as $file) {
+        $dir = dirname($file);
+        if (!is_dir($dir) && !@mkdir($dir, 0777, true) && !is_dir($dir)) {
+            continue;
+        }
+
+        if (is_writable($dir)) {
+            return $file;
+        }
+    }
+
+    return __DIR__ . '/data/exam.db';
+}
+
+define('DB_FILE', resolveDbFile());
 
 function schemaSql(): string {
     return <<<'SQL'
@@ -84,25 +105,50 @@ CREATE TABLE IF NOT EXISTS exam_rooms (
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     deleted_at TEXT DEFAULT NULL
 );
+
+CREATE TABLE IF NOT EXISTS score_input_assignments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    ma_mon TEXT NOT NULL,
+    component TEXT NOT NULL,
+    is_deleted INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    deleted_at TEXT DEFAULT NULL,
+    UNIQUE(user_id, ma_mon, component),
+    FOREIGN KEY(user_id) REFERENCES users(id)
+);
 SQL;
 }
 
 function db(): PDO {
     static $pdo = null;
-    if ($pdo === null) {
+    if ($pdo !== null) {
+        return $pdo;
+    }
+
+    if (!in_array('sqlite', PDO::getAvailableDrivers(), true)) {
+        throw new RuntimeException('Máy chủ chưa bật PDO SQLite. Hãy bật extension pdo_sqlite/sqlite3 trong PHP.');
+    }
+
+    try {
         $needInit = !file_exists(DB_FILE);
         $pdo = new PDO('sqlite:' . DB_FILE);
         $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+        $pdo->exec(schemaSql());
         if ($needInit) {
             initializeDatabase($pdo);
+        } else {
+            ensureSeedData($pdo);
         }
+        syncSubjectsFromMonXml($pdo);
+    } catch (Throwable $e) {
+        throw new RuntimeException('Không thể khởi tạo CSDL tại: ' . DB_FILE . '. Chi tiết: ' . $e->getMessage());
     }
+
     return $pdo;
 }
 
 function initializeDatabase(PDO $pdo): void {
-    $pdo->exec(schemaSql());
-
     $adminPass = password_hash('admin123', PASSWORD_DEFAULT);
     $managerPass = password_hash('manager123', PASSWORD_DEFAULT);
     $inputPass = password_hash('input123', PASSWORD_DEFAULT);
@@ -112,10 +158,19 @@ function initializeDatabase(PDO $pdo): void {
         ('qlthi','$managerPass','Quản lý thi','exam_manager'),
         ('nhapdiem','$inputPass','Nhập điểm thi','score_input')");
 
+    ensureSeedData($pdo);
+
+    $pdo->exec("INSERT INTO students (ma_hs,ho_dem,ten,ngay_sinh,ma_lop) VALUES
+        ('HS001','Nguyễn Văn','An','2007-01-02','12A1'),
+        ('HS002','Trần Thị','Bình','2007-03-12','12A2'),
+        ('HS003','Lê Văn','Cường','2007-05-22','12A1')");
+}
+
+function ensureSeedData(PDO $pdo): void {
     $permissions = [
-        'manage_users','manage_permissions','view_dashboard','manage_students','manage_subjects','manage_scores','manage_exam_rooms','print_reports','import_students'
+        'manage_users','manage_permissions','view_dashboard','manage_students','manage_subjects','manage_scores','manage_exam_rooms','print_reports','import_students','manage_score_assignments'
     ];
-    $stmt = $pdo->prepare('INSERT INTO permissions(code,description) VALUES(?,?)');
+    $stmt = $pdo->prepare('INSERT OR IGNORE INTO permissions(code,description) VALUES(?,?)');
     foreach ($permissions as $code) {
         $stmt->execute([$code, $code]);
     }
@@ -126,18 +181,34 @@ function initializeDatabase(PDO $pdo): void {
         'score_input' => ['view_dashboard','manage_scores']
     ];
 
+    $insertRolePerm = $pdo->prepare('INSERT OR IGNORE INTO role_permissions(role,permission_code) VALUES(?,?)');
     foreach ($rolePerms as $role => $codes) {
         foreach ($codes as $code) {
-            $pdo->prepare('INSERT INTO role_permissions(role,permission_code) VALUES(?,?)')->execute([$role,$code]);
+            $insertRolePerm->execute([$role,$code]);
         }
     }
 
-    $pdo->exec("INSERT INTO students (ma_hs,ho_dem,ten,ngay_sinh,ma_lop) VALUES
-        ('HS001','Nguyễn Văn','An','2007-01-02','12A1'),
-        ('HS002','Trần Thị','Bình','2007-03-12','12A2'),
-        ('HS003','Lê Văn','Cường','2007-05-22','12A1')");
-    $pdo->exec("INSERT INTO subjects (ma_mon,ten_mon) VALUES
-        ('TOAN','Toán'),('VAN','Ngữ văn'),('ANH','Tiếng Anh')");
+    $hasUsers = (int)$pdo->query("SELECT COUNT(*) FROM users")->fetchColumn();
+    if ($hasUsers === 0) {
+        $stmtUser = $pdo->prepare('INSERT INTO users(username,password_hash,full_name,role) VALUES(?,?,?,?)');
+        $stmtUser->execute(['admin', password_hash('admin123', PASSWORD_DEFAULT), 'Quản trị hệ thống', 'admin']);
+        $stmtUser->execute(['qlthi', password_hash('manager123', PASSWORD_DEFAULT), 'Quản lý thi', 'exam_manager']);
+        $stmtUser->execute(['nhapdiem', password_hash('input123', PASSWORD_DEFAULT), 'Nhập điểm thi', 'score_input']);
+    }
+}
+
+function syncSubjectsFromMonXml(PDO $pdo): void {
+    $file = __DIR__ . '/MON.xml';
+    if (!file_exists($file)) return;
+    $xml = @simplexml_load_file($file);
+    if (!$xml) return;
+    $stmt = $pdo->prepare('INSERT INTO subjects(ma_mon,ten_mon) VALUES(?,?) ON CONFLICT(ma_mon) DO UPDATE SET ten_mon=excluded.ten_mon, is_deleted=0, deleted_at=NULL');
+    foreach ($xml->Subject as $subject) {
+        $ma = trim((string)$subject->MaMon);
+        $ten = trim((string)$subject->TenMon);
+        if ($ma === '' || $ten === '') continue;
+        $stmt->execute([$ma, $ten]);
+    }
 }
 
 function jsonResponse($data, int $status = 200): void {
